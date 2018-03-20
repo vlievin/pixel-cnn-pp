@@ -3,30 +3,31 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Variable
-from layers import * 
-from utils import * 
+from pixelCNN.layers import * 
+from pixelCNN.utils import * 
 import numpy as np
 
 class PixelCNNLayer_up(nn.Module):
-    def __init__(self, nr_resnet, nr_filters, resnet_nonlinearity):
+    def __init__(self, nr_resnet, nr_filters, resnet_nonlinearity,conditional_features=None):
         super(PixelCNNLayer_up, self).__init__()
+        self.conditional_features = conditional_features
         self.nr_resnet = nr_resnet
         # stream from pixels above
         self.u_stream = nn.ModuleList([gated_resnet(nr_filters, down_shifted_conv2d, 
-                                        resnet_nonlinearity, skip_connection=0) 
+                                        resnet_nonlinearity, skip_connection=0,conditional_features=conditional_features) 
                                             for _ in range(nr_resnet)])
         
         # stream from pixels above and to thes left
         self.ul_stream = nn.ModuleList([gated_resnet(nr_filters, down_right_shifted_conv2d, 
-                                        resnet_nonlinearity, skip_connection=1) 
+                                        resnet_nonlinearity, skip_connection=1,conditional_features=conditional_features) 
                                             for _ in range(nr_resnet)])
 
-    def forward(self, u, ul):
+    def forward(self, u, ul,cf=None):
         u_list, ul_list = [], []
         
         for i in range(self.nr_resnet):
             u  = self.u_stream[i](u)
-            ul = self.ul_stream[i](ul, a=u)
+            ul = self.ul_stream[i](ul, a=u, cf=cf)
             u_list  += [u]
             ul_list += [ul]
 
@@ -34,48 +35,54 @@ class PixelCNNLayer_up(nn.Module):
 
 
 class PixelCNNLayer_down(nn.Module):
-    def __init__(self, nr_resnet, nr_filters, resnet_nonlinearity):
+    def __init__(self, nr_resnet, nr_filters, resnet_nonlinearity, conditional_features=None):
         super(PixelCNNLayer_down, self).__init__()
+        self.conditional_features = conditional_features
         self.nr_resnet = nr_resnet
         # stream from pixels above
         self.u_stream  = nn.ModuleList([gated_resnet(nr_filters, down_shifted_conv2d, 
-                                        resnet_nonlinearity, skip_connection=1) 
+                                        resnet_nonlinearity, skip_connection=1,conditional_features=conditional_features) 
                                             for _ in range(nr_resnet)])
         
         # stream from pixels above and to thes left
         self.ul_stream = nn.ModuleList([gated_resnet(nr_filters, down_right_shifted_conv2d, 
-                                        resnet_nonlinearity, skip_connection=2) 
+                                        resnet_nonlinearity, skip_connection=2,conditional_features=conditional_features) 
                                             for _ in range(nr_resnet)])
 
-    def forward(self, u, ul, u_list, ul_list):
+    def forward(self, u, ul, u_list, ul_list,cf=None):
         for i in range(self.nr_resnet):
-            u  = self.u_stream[i](u, a=u_list.pop())
-            ul = self.ul_stream[i](ul, a=torch.cat((u, ul_list.pop()), 1))
+            u  = self.u_stream[i](u, a=u_list.pop(),cf=cf)
+            ul = self.ul_stream[i](ul, a=torch.cat((u, ul_list.pop()), 1), cf=cf)
         
         return u, ul
          
 
 class PixelCNN(nn.Module):
     def __init__(self, nr_resnet=5, nr_filters=80, nr_logistic_mix=10, 
-                    resnet_nonlinearity='concat_elu', input_channels=3):
+                    resnet_nonlinearity='concat_elu', input_channels=3, conditional_features=None):
         super(PixelCNN, self).__init__()
         if resnet_nonlinearity == 'concat_elu' : 
             self.resnet_nonlinearity = lambda x : concat_elu(x)
         else : 
             raise Exception('right now only concat elu is supported as resnet nonlinearity.')
 
+        # ops
+        self.loss_op   = lambda real, fake : discretized_mix_logistic_loss(real, fake)
+        self.sample_op = lambda x : sample_from_discretized_mix_logistic(x, nr_logistic_mix)
+        # parameters
+        self.conditional_features = conditional_features
         self.nr_filters = nr_filters
         self.input_channels = input_channels
         self.nr_logistic_mix = nr_logistic_mix
         self.right_shift_pad = nn.ZeroPad2d((1, 0, 0, 0))
         self.down_shift_pad  = nn.ZeroPad2d((0, 0, 1, 0))
-
+        # network
         down_nr_resnet = [nr_resnet] + [nr_resnet + 1] * 2
         self.down_layers = nn.ModuleList([PixelCNNLayer_down(down_nr_resnet[i], nr_filters, 
-                                                self.resnet_nonlinearity) for i in range(3)])
+                                                self.resnet_nonlinearity, conditional_features) for i in range(3)])
 
         self.up_layers   = nn.ModuleList([PixelCNNLayer_up(nr_resnet, nr_filters, 
-                                                self.resnet_nonlinearity) for _ in range(3)])
+                                                self.resnet_nonlinearity, conditional_features) for _ in range(3)])
 
         self.downsize_u_stream  = nn.ModuleList([down_shifted_conv2d(nr_filters, nr_filters, 
                                                     stride=(2,2)) for _ in range(2)])
@@ -102,7 +109,7 @@ class PixelCNN(nn.Module):
         self.init_padding = None
 
 
-    def forward(self, x, sample=False):
+    def forward(self, x, sample=False, cf=None):
         # similar as done in the tf repo :  
         if self.init_padding is None and not sample: 
             xs = [int(y) for y in x.size()]
@@ -121,7 +128,7 @@ class PixelCNN(nn.Module):
         ul_list = [self.ul_init[0](x) + self.ul_init[1](x)]
         for i in range(3):
             # resnet block
-            u_out, ul_out = self.up_layers[i](u_list[-1], ul_list[-1])
+            u_out, ul_out = self.up_layers[i](u_list[-1], ul_list[-1], cf=cf)
             u_list  += u_out
             ul_list += ul_out
 
@@ -136,7 +143,7 @@ class PixelCNN(nn.Module):
         
         for i in range(3):
             # resnet block
-            u, ul = self.down_layers[i](u, ul, u_list, ul_list)
+            u, ul = self.down_layers[i](u, ul, u_list, ul_list, cf=cf)
 
             # upscale (only twice)
             if i != 2 :
@@ -148,8 +155,15 @@ class PixelCNN(nn.Module):
         assert len(u_list) == len(ul_list) == 0, pdb.set_trace()
 
         return x_out
+    
+    def getloss(self,x,cf=None):
+        x_ = self.forward(x, cf=cf)
+        loss = self.loss_op(x,x_)
+        diagnostics = {'loss': loss.data.mean()}
+        data = {'x_':x_}
+        return loss, diagnostics, data
+    
         
-
 if __name__ == '__main__':
     ''' testing loss with tf version '''
     np.random.seed(1)

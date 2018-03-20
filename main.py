@@ -8,8 +8,8 @@ import torch.optim as optim
 from torch.optim import lr_scheduler
 from torchvision import datasets, transforms, utils
 from tensorboardX import SummaryWriter
-from utils import * 
-from model import * 
+from pixelCNN.utils import * 
+from pixelCNN.model import * 
 from PIL import Image
 
 parser = argparse.ArgumentParser()
